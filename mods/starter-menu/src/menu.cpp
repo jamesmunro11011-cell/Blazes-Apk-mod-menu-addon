@@ -110,6 +110,21 @@ static struct {
     Method<float> clipLength;
     Method<BNM::Structures::Mono::String *> objGetName;
     BNM::MonoType *tAudioSource = nullptr, *tAudioClip = nullptr;
+    // voice chat / mic (best-effort): feed a clip into the player's voice stream
+    BNM::MonoType *tRecorder = nullptr;
+    Method<void> recorderRestart;                      // RestartRecording()  (older Photon Voice)
+    Method<void> recorderRestart1;                     // RestartRecording(bool force)  (newer)
+    Field<Il2CppObject *> recorderAudioClip;           // backing field, fallback only
+    Field<bool> recorderLoop;
+    Field<int> recorderMicType, recorderSourceType;
+    // Photon Voice exposes these as PROPERTIES (AudioClip, LoopAudioClip, SourceType), so the
+    // setters are what we call; the fields above are only a fallback.
+    Method<void> recSetClip, recSetLoop, recSetSourceType;
+    Method<Il2CppObject *> recGetClip;
+    Method<bool> recGetLoop, recIsRecording;
+    Method<int> recGetSourceType, clipLoadType;
+    Method<bool> goActiveInHier;
+    Method<Il2CppObject *> findAllRecorder;
     Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger;
 } G;
 
@@ -263,6 +278,42 @@ static bool Lookups() {
         }
         G.objGetName = obj.GetMethod("get_name", 0);
     }
+    {   // voice chat / mic: discover the Photon Voice Recorder
+        Class rec("Photon.Voice.Unity", "Recorder");
+        if (rec.IsValid()) {
+            G.tRecorder = rec.GetMonoType();
+            G.recorderRestart = rec.GetMethod("RestartRecording", 0);
+            G.recorderRestart1 = rec.GetMethod("RestartRecording", 1);
+            G.recSetClip = rec.GetMethod("set_AudioClip", 1);
+            G.recGetClip = rec.GetMethod("get_AudioClip", 0);
+            G.recSetLoop = rec.GetMethod("set_LoopAudioClip", 1);
+            G.recGetLoop = rec.GetMethod("get_LoopAudioClip", 0);
+            G.recSetSourceType = rec.GetMethod("set_SourceType", 1);
+            G.recGetSourceType = rec.GetMethod("get_SourceType", 0);
+            G.recIsRecording = rec.GetMethod("get_IsRecording", 0);
+            for (const char *n : {"AudioClip", "audioClip"}) if (!G.recorderAudioClip.IsValid()) G.recorderAudioClip = rec.GetField(n);
+            for (const char *n : {"LoopAudioClip", "loopAudioClip"}) if (!G.recorderLoop.IsValid()) G.recorderLoop = rec.GetField(n);
+            for (const char *n : {"SourceType", "sourceType"}) if (!G.recorderSourceType.IsValid()) G.recorderSourceType = rec.GetField(n);
+            G.recorderMicType = rec.GetField("MicrophoneType");
+            G.goActiveInHier = Class("UnityEngine", "GameObject").GetMethod("get_activeInHierarchy", 0);
+            if (G.tAudioClip) G.clipLoadType = Class("UnityEngine", "AudioClip").GetMethod("get_loadType", 0);
+            // one-time log of what exists, so names can be fixed from the device log
+            std::string methods;
+            for (auto &m : rec.GetMethods(false)) if (m.GetInfo() && m.GetInfo()->name) {
+                char b[96]; snprintf(b, sizeof b, "%s(%d),", m.GetInfo()->name, (int)m.GetInfo()->parameters_count); methods += b;
+            }
+            ym::log("starter-menu: Recorder methods: %s", methods.c_str());
+            std::string fields;
+            for (auto &f : rec.GetFields()) if (f.GetInfo() && f.GetInfo()->name) { fields += f.GetInfo()->name; fields += ","; }
+            ym::log("starter-menu: Recorder fields: %s", fields.c_str());
+            ym::log("starter-menu: mic hooks: setClip=%d setSource=%d setLoop=%d restart0=%d restart1=%d clipField=%d srcField=%d",
+                    G.recSetClip.IsValid(), G.recSetSourceType.IsValid(), G.recSetLoop.IsValid(),
+                    G.recorderRestart.IsValid(), G.recorderRestart1.IsValid(),
+                    G.recorderAudioClip.IsValid(), G.recorderSourceType.IsValid());
+        } else {
+            ym::log("starter-menu: Photon.Voice.Unity.Recorder not found");
+        }
+    }
     G.tFont = Class("UnityEngine", "Font").GetMonoType();
     G.usagePrimary.set((Il2CppObject *)CreateMonoString("PrimaryButton"));
     G.usageSecondary.set((Il2CppObject *)CreateMonoString("SecondaryButton"));
@@ -336,6 +387,7 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_spawnOnHand, f_car;
+static bool f_micSounds = true;                // soundboard clips also go out on your voice chat
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
 static std::vector<PendingItem> g_itemQueue;
@@ -443,6 +495,7 @@ static Item g_items[] = {
     {SOUNDS, "Exit Soundboard", OPEN, MAIN},
     {SOUNDS, "Stop Sounds", ACTION, MAIN, nullptr, StopSounds},
     {SOUNDS, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
+    {SOUNDS, "Play Through Mic", TOGGLE, MAIN, &f_micSounds},
     {SOUNDS, "More Sounds", ACTION, MAIN, nullptr, MoreSounds},
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
@@ -489,9 +542,10 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
     {"Notifications", "Messages when you switch something."},
-    {"Soundboard", "Play the game's own sounds. Only you hear them."},
+    {"Soundboard", "Play the game's own sounds. Everyone hears them (through your mic)."},
     {"Stop Sounds", "Stops everything the soundboard is playing."},
     {"Sound Volume", "Loud, medium or quiet."},
+    {"Play Through Mic", "On: everyone hears the sound on your voice chat. Off: only you."},
     {"More Sounds", "Shows the next set of sounds."},
     {"Turn Everything Off", "Switches every mod off."},
 };
@@ -1428,13 +1482,20 @@ static void SpawnOnHandTick(const Buttons &in) {
     g_itemQueue.push_back({G.trGetPosition[hand]() + G.trGetForward[hand]() * 0.1f, Vector3(0, 0, 0)});
 }
 
-// ---- soundboard (local only) ---------------------------------------------------
-// Plays clips the game already has, through a 2D audio source on your head. Only you
-// hear it: nothing goes to voice chat or the room, and no files are read.
+// ---- soundboard ---------------------------------------------------------------
+// Plays clips the game already has. A copy plays locally on your head, and the same
+// clip is fed into your voice chat (your mic stream) so everyone hears it, like a
+// real-life soundboard. No files are read.
 
 static Ref g_soundGo, g_soundSrc, g_clip[kMaxSounds];
 static char g_clipName[kMaxSounds][32];
 static int g_clipOffset = 0, g_soundVol = 0;
+// mic routing state: what the Recorder was doing before we borrowed it
+static Ref g_micRec, g_micOrigClip;
+static bool g_micActive = false, g_micOrigLoop = true;
+static int g_micOrigSource = -1;                 // Recorder.InputSourceType: 0 Microphone, 1 AudioClip, 2 Factory
+static double g_micRestoreAt = 0;
+static constexpr int kSrcMic = 0, kSrcClip = 1;
 static const float kSoundVolumes[] = {1.0f, 0.6f, 0.3f};
 
 static bool EnsureSource() {
@@ -1454,12 +1515,102 @@ static bool EnsureSource() {
     return true;
 }
 
+// The game can hold several Recorder objects (prefabs, disabled copies). Pick the live one:
+// recording right now first, else an enabled one on an active object.
+static Il2CppObject *FindRecorder() {
+    if (!G.tRecorder || !G.findAll.IsValid()) return nullptr;
+    auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tRecorder);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    Il2CppObject *active = nullptr, *any = nullptr;
+    for (size_t i = 0; i < n && i < 32; i++) {
+        Il2CppObject *r = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(r)) continue;
+        if (!any) any = r;
+        Il2CppObject *go = G.compGameObject.IsValid() ? G.compGameObject[r]() : nullptr;
+        bool inScene = !G.goActiveInHier.IsValid() || (go && G.goActiveInHier[go]());
+        bool on = !G.behaviourGetEnabled.IsValid() || G.behaviourGetEnabled[r]();
+        if (G.recIsRecording.IsValid() && inScene && G.recIsRecording[r]()) return r;
+        if (!active && inScene && on) active = r;
+    }
+    return active ? active : any;
+}
+static void RecSetClip(Il2CppObject *rec, Il2CppObject *clip) {
+    if (G.recSetClip.IsValid()) G.recSetClip[rec](clip);
+    else if (G.recorderAudioClip.IsValid()) G.recorderAudioClip[rec] = clip;
+}
+static void RecSetLoop(Il2CppObject *rec, bool v) {
+    if (G.recSetLoop.IsValid()) G.recSetLoop[rec](v);
+    else if (G.recorderLoop.IsValid()) G.recorderLoop[rec] = v;
+}
+static void RecSetSource(Il2CppObject *rec, int v) {
+    if (G.recSetSourceType.IsValid()) G.recSetSourceType[rec](v);
+    else if (G.recorderSourceType.IsValid()) G.recorderSourceType[rec] = v;
+}
+static void RecRestart(Il2CppObject *rec) {
+    if (G.recorderRestart1.IsValid()) G.recorderRestart1[rec](true);   // force
+    else if (G.recorderRestart.IsValid()) G.recorderRestart[rec]();
+}
+static bool MicHooksOk() {
+    bool clip = G.recSetClip.IsValid() || G.recorderAudioClip.IsValid();
+    bool src = G.recSetSourceType.IsValid() || G.recorderSourceType.IsValid();
+    bool restart = G.recorderRestart.IsValid() || G.recorderRestart1.IsValid();
+    return clip && src && restart;
+}
+static void RestoreMic() {
+    g_micRestoreAt = 0;
+    if (!g_micActive) return;
+    g_micActive = false;
+    Il2CppObject *rec = g_micRec.get();
+    if (Alive(rec)) {
+        RecSetSource(rec, g_micOrigSource >= 0 ? g_micOrigSource : kSrcMic);   // back to your real mic
+        RecSetClip(rec, g_micOrigClip.get());
+        RecSetLoop(rec, g_micOrigLoop);
+        RecRestart(rec);
+        ym::log("starter-menu: mic restored (source %d)", g_micOrigSource >= 0 ? g_micOrigSource : kSrcMic);
+    }
+    g_micRec.clear();
+    g_micOrigClip.clear();
+    g_micOrigSource = -1;
+}
+// Returns true if the clip was handed to the voice recorder.
+static bool PlayThroughMic(int i) {
+    if (!f_micSounds) return false;
+    Il2CppObject *clip = g_clip[i].get();
+    if (!Alive(clip)) return false;
+    if (!MicHooksOk()) {
+        ym::log("starter-menu: mic hooks missing (see 'mic hooks:' line from startup)");
+        return false;
+    }
+    Il2CppObject *rec = g_micActive ? g_micRec.get() : FindRecorder();
+    if (!Alive(rec)) { g_micActive = false; rec = FindRecorder(); }
+    if (!rec) { ym::log("starter-menu: no Recorder for mic playback"); return false; }
+    if (!g_micActive) {                           // remember what it was doing, once
+        g_micRec.set(rec);
+        g_micOrigClip.set(G.recGetClip.IsValid() ? G.recGetClip[rec]() : nullptr);
+        g_micOrigSource = G.recGetSourceType.IsValid() ? G.recGetSourceType[rec]() : -1;
+        g_micOrigLoop = G.recGetLoop.IsValid() ? G.recGetLoop[rec]() : true;
+        g_micActive = true;
+        ym::log("starter-menu: recorder was source=%d loop=%d", g_micOrigSource, (int)g_micOrigLoop);
+    }
+    if (G.clipLoadType.IsValid())
+        ym::log("starter-menu: clip loadType=%d (0 = decompress on load; others may not play on the mic)", G.clipLoadType[clip]());
+    RecSetLoop(rec, false);
+    RecSetClip(rec, clip);
+    RecSetSource(rec, kSrcClip);                  // without this the Recorder keeps reading the real mic
+    RecRestart(rec);
+    float len = G.clipLength.IsValid() ? G.clipLength[clip]() : 1.0f;
+    if (len < 0.5f) len = 0.5f;
+    g_micRestoreAt = g_time + len + 0.5f;         // a little tail so the end isn't cut off
+    ym::log("starter-menu: mic playback started (%.1fs)", len);
+    return true;
+}
 static void PlayClip(int i) {
     if (i < 0 || i >= g_soundCount) return;
     Il2CppObject *clip = g_clip[i].get();
     if (!Alive(clip) || !G.asPlayOneShot.IsValid() || !EnsureSource()) { Notify("Can't play that one"); return; }
     G.asPlayOneShot[g_soundSrc.get()](clip, kSoundVolumes[g_soundVol]);
-    Notify("Playing: %s", g_clipName[i]);
+    bool mic = PlayThroughMic(i);
+    Notify(mic ? "Playing (mic): %s" : "Playing: %s", g_clipName[i]);
 }
 template <int N> static void PlaySlot() { PlayClip(N); }
 static void (*const kSlotFns[kMaxSounds])() = {
@@ -1499,7 +1650,7 @@ static void ScanClips() {
     }
 }
 static void MoreSounds() { g_clipOffset += kMaxSounds; ScanClips(); g_page = 0; Notify("Next sounds"); }
-static void StopSounds() { Kill(g_soundGo); g_soundSrc.clear(); Notify("Sounds stopped"); }
+static void StopSounds() { Kill(g_soundGo); g_soundSrc.clear(); RestoreMic(); Notify("Sounds stopped"); }
 static void NextSoundVolume() {
     g_soundVol = (g_soundVol + 1) % 3;
     Notify("Sound volume: %d%%", (int)(kSoundVolumes[g_soundVol] * 100));
@@ -1521,6 +1672,7 @@ static void OnRoomChange() {
     }
     g_boosted = nullptr;
     g_gravityOff = false;
+    g_micActive = false; g_micRestoreAt = 0; g_micRec.clear(); g_micOrigClip.clear(); g_micOrigSource = -1;
     for (Ref *r : {&g_player, &g_rigidbody, &g_leftHand, &g_rightHand, &g_head}) r->clear();
     g_built = false; g_menuShown = false; g_touching = -2; g_haveSpot = false;
 }
@@ -1568,6 +1720,7 @@ static void OnUpdate(float dt) {
     TeleportGunTick(in);
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("starter-menu: item code error"); }
+    if (g_micRestoreAt > 0 && g_time >= g_micRestoreAt) RestoreMic();
     DanceTick(in, dt);              // last: it moves your hands after everything else
 }
 
