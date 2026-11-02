@@ -1692,7 +1692,6 @@ extern void (*const kSlotFns[kMaxSounds])();
 static std::string g_wavPath[kMaxSounds];
 static bool g_wavMode = false;
 static constexpr size_t kMaxWavBytes = 40u * 1024 * 1024;
-static constexpr int kMaxWavSeconds = 90;
 
 static std::string SoundsDir() {
     const char *d = ym::api()->modsDir;
@@ -1743,10 +1742,7 @@ static bool DecodeWav(const std::vector<uint8_t> &b, std::vector<float> &mono, i
         return false;
     }
     size_t bps = bits / 8, frames = dataLen / (ch * bps);
-    if (frames == 0 || frames > (size_t)hz * kMaxWavSeconds) {
-        snprintf(g_wavWhy, sizeof g_wavWhy, "too long: %zu s (max %d)", hz ? frames / hz : 0, kMaxWavSeconds);
-        return false;
-    }
+    if (frames == 0) { snprintf(g_wavWhy, sizeof g_wavWhy, "no audio data"); return false; }
     mono.assign(frames, 0.0f);
     for (size_t f = 0; f < frames; f++) {
         float sum = 0;
