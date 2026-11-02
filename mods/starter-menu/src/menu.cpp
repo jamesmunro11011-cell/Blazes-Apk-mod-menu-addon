@@ -8,6 +8,7 @@
 // Movement only changes your own game. Rig mods (dances) and Items are seen by the room,
 // within the limits in AGENTS.md ("Things others see"). Read docs/GUIDE.md before adding.
 #include "ymsdk.hpp"
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -15,6 +16,9 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <dirent.h>
+#include <strings.h>
 
 using namespace BNM;
 using namespace BNM::Structures::Unity;
@@ -77,6 +81,7 @@ static struct {
                  textSetMaxSize, teleportTo, rbAddForce, rbSetUseGravity, colliderSetEnabled,
                  lrSetPositionCount, lrSetPosition, lrSetStartWidth, lrSetEndWidth, lrSetUseWorldSpace;
     Method<Quaternion> trGetRotation;
+    Method<Vector3> trGetLocalScale;
     Method<Vector3> trGetPosition, trGetForward, trGetRight, trGetUp, trInverseTransformPoint, trTransformPoint, rbGetVelocity;
     Method<bool> alive, tryGetBool, haptic, raycast;
     Method<XRDevice> deviceAtNode;
@@ -110,6 +115,10 @@ static struct {
     Method<float> clipLength;
     Method<BNM::Structures::Mono::String *> objGetName;
     BNM::MonoType *tAudioSource = nullptr, *tAudioClip = nullptr;
+    // .wav soundboard: build an AudioClip from a file (AudioClip.Create + SetData)
+    Method<Il2CppObject *> clipCreate;
+    Method<bool> clipSetData;
+    BNM::IL2CPP::Il2CppClass *singleClass = nullptr;
     // voice chat / mic (best-effort): feed a clip into the player's voice stream
     BNM::MonoType *tRecorder = nullptr;
     Method<void> recorderRestart;                      // RestartRecording()  (older Photon Voice)
@@ -127,6 +136,22 @@ static struct {
     Method<Il2CppObject *> findAllRecorder;
     Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger;
 } G;
+
+// Part of the name of the font the menu should start with (not case sensitive match on the
+// font's name, e.g. "Londrina"). Leave it empty to start with Arial. The Settings page has a
+// "Change Font" button that cycles through every font the game has loaded and shows each name.
+static const char *kPreferredFont = "";
+static bool ContainsNoCase(const std::string &hay, const char *needle) {
+    size_t n = strlen(needle);
+    if (n == 0 || hay.size() < n) return false;
+    for (size_t i = 0; i + n <= hay.size(); i++) {
+        size_t j = 0;
+        while (j < n && tolower((unsigned char)hay[i + j]) == tolower((unsigned char)needle[j])) j++;
+        if (j == n) return true;
+    }
+    return false;
+}
+
 
 static bool Lookups() {
     if (G.ok) return true;
@@ -156,6 +181,7 @@ static bool Lookups() {
     G.trSetLocalPosition = tr.GetMethod("set_localPosition", 1);
     G.trSetLocalRotation = tr.GetMethod("set_localRotation", 1);
     G.trSetLocalScale = tr.GetMethod("set_localScale", 1);
+    G.trGetLocalScale = tr.GetMethod("get_localScale", 0);
     G.trGetPosition = tr.GetMethod("get_position", 0);
     G.trGetRotation = tr.GetMethod("get_rotation", 0);
     G.trGetForward = tr.GetMethod("get_forward", 0);
@@ -275,6 +301,11 @@ static bool Lookups() {
             G.asPlayOneShot = Overload(asrc, "PlayOneShot", {"UnityEngine.AudioClip", "System.Single"});
             G.asSetSpatial = asrc.GetMethod("set_spatialBlend", 1);
             G.clipLength = aclip.GetMethod("get_length", 0);
+            G.clipCreate = Overload(aclip, "Create", {"System.String", "System.Int32", "System.Int32", "System.Int32", "System.Boolean"});
+            G.clipSetData = Overload(aclip, "SetData", {"System.Single[]", "System.Int32"});
+            G.singleClass = Class("System", "Single").GetClass();
+            ym::log("starter-menu: wav hooks: create=%d setdata=%d array=%d", G.clipCreate.IsValid(), G.clipSetData.IsValid(),
+                    G.arrayNew != nullptr && G.singleClass != nullptr);
         }
         G.objGetName = obj.GetMethod("get_name", 0);
     }
@@ -328,6 +359,22 @@ static bool Lookups() {
     if (!G.font.get() && G.findAll.IsValid() && G.tFont) {   // else any font the game loaded (one time)
         auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tFont);
         if (arr && *(uintptr_t *)(arr + 0x18) > 0) G.font.set(((Il2CppObject **)(arr + 0x20))[0]);
+    }
+    {   // list the game's fonts once, and use the preferred one if it is set
+        auto *arr = (G.findAll.IsValid() && G.tFont) ? (uint8_t *)G.findAll((Il2CppObject *)G.tFont) : nullptr;
+        size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+        std::string names;
+        bool matched = false;
+        for (size_t i = 0; i < n && i < 64; i++) {
+            Il2CppObject *f = ((Il2CppObject **)(arr + 0x20))[i];
+            if (!f || !G.objGetName.IsValid()) continue;
+            auto *nm = G.objGetName[f]();
+            if (!nm) continue;
+            std::string name = nm->str();
+            if (names.size() < 300) names += name + ",";
+            if (!matched && kPreferredFont[0] && ContainsNoCase(name, kPreferredFont)) { G.font.set(f); matched = true; }
+        }
+        ym::log("starter-menu: %zu fonts: %s", n, names.c_str());
     }
     G.ok = G.createPrimitive.IsValid() && G.goTransform.IsValid() && G.trSetPosition.IsValid() &&
            G.deviceAtNode.IsValid() && G.tryGetBool.IsValid() && G.leftHand.IsValid();
@@ -387,6 +434,7 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_spawnOnHand, f_car;
+static bool f_size;                            // Size Changer: scales your own player object
 static bool f_micSounds = true;                // soundboard clips also go out on your voice chat
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
@@ -407,6 +455,8 @@ static void Notify(const char *fmt, ...);
 static void SaveSpot();
 static void GoToSpot();
 static void NextTheme();
+static void ChangeFont();
+static void NextSize();
 static void AllOff();
 static void PointerToHand();
 static void NextPointer();
@@ -422,6 +472,7 @@ static void ScanClips();
 static void StopSounds();
 static void NextSoundVolume();
 static void MoreSounds();
+static void RescanSongs();
 
 enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SETTINGS, ENABLED, SOUNDS, NCAT };
 static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Settings", "Enabled Mods", "Soundboard"};
@@ -435,7 +486,7 @@ struct Item {
     void (*fn)() = nullptr;       // ACTION, or called after a TOGGLE changes
 };
 // Soundboard rows are filled in when you open the page (ScanClips).
-static constexpr int kMaxSounds = 16;
+static constexpr int kMaxSounds = 32;
 static Item g_soundItems[kMaxSounds];
 static int g_soundCount = 0;
 
@@ -460,6 +511,8 @@ static Item g_items[] = {
     {MOVEMENT, "Speed Boost", TOGGLE, MAIN, &f_speedBoost, ApplySpeedBoost},
     {MOVEMENT, "No Gravity", TOGGLE, MAIN, &f_noGravity, ApplyGravity},
     {MOVEMENT, "Low Gravity", TOGGLE, MAIN, &f_lowGravity},
+    {MOVEMENT, "Size Changer", TOGGLE, MAIN, &f_size},
+    {MOVEMENT, "Size Preset", ACTION, MAIN, nullptr, NextSize},
     {MOVEMENT, "Save Spot", ACTION, MAIN, nullptr, SaveSpot},
     {MOVEMENT, "Go To Spot", ACTION, MAIN, nullptr, GoToSpot},
 
@@ -486,6 +539,7 @@ static Item g_items[] = {
     {SETTINGS, "Car Speed", ACTION, MAIN, nullptr, NextCarSpeed},
     {SETTINGS, "Right Hand Menu", TOGGLE, MAIN, &f_rightHand, PointerToHand},
     {SETTINGS, "Change Menu Theme", ACTION, MAIN, nullptr, NextTheme},
+    {SETTINGS, "Change Font", ACTION, MAIN, nullptr, ChangeFont},
     {SETTINGS, "Rainbow Menu", TOGGLE, MAIN, &f_rainbow},
     {SETTINGS, "Show FPS", TOGGLE, MAIN, &f_fps},
     {SETTINGS, "Show Clock", TOGGLE, MAIN, &f_clock},
@@ -496,6 +550,7 @@ static Item g_items[] = {
     {SOUNDS, "Stop Sounds", ACTION, MAIN, nullptr, StopSounds},
     {SOUNDS, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
     {SOUNDS, "Play Through Mic", TOGGLE, MAIN, &f_micSounds},
+    {SOUNDS, "Rescan Songs", ACTION, MAIN, nullptr, RescanSongs},
     {SOUNDS, "More Sounds", ACTION, MAIN, nullptr, MoreSounds},
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
@@ -518,9 +573,12 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Speed Boost", "Faster and higher jumps."},
     {"No Gravity", "Turns your gravity off."},
     {"Low Gravity", "Jump higher, fall slower."},
+    {"Size Changer", "Makes you bigger or smaller. It may only change on your own screen."},
+    {"Size Preset", "Tiny, small, big, huge or giant."},
     {"Save Spot", "Remembers where you are."},
     {"Go To Spot", "Teleports you to your saved spot."},
     {"Change Menu Theme", "Burger, Blaze, Orange, Blue, Green, Purple, Dark."},
+    {"Change Font", "Cycles through the fonts the game has loaded. Shows the name."},
     {"Rainbow Menu", "The menu cycles through colors."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
@@ -542,7 +600,8 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
     {"Notifications", "Messages when you switch something."},
-    {"Soundboard", "Play the game's own sounds. Everyone hears them (through your mic)."},
+    {"Soundboard", "Plays .wav files from the sounds folder (or the game's sounds). Everyone hears them on your mic."},
+    {"Rescan Songs", "Looks in the sounds folder again."},
     {"Stop Sounds", "Stops everything the soundboard is playing."},
     {"Sound Volume", "Loud, medium or quiet."},
     {"Play Through Mic", "On: everyone hears the sound on your voice chat. Off: only you."},
@@ -1613,8 +1672,134 @@ static bool PlayThroughMic(int i) {
     ym::log("starter-menu: mic playback started (%.1fs)", len);
     return true;
 }
+// ---- .wav files -----------------------------------------------------------------
+// Put .wav files in a folder called "sounds" inside your mods folder (api->modsDir).
+// Each file is turned into an AudioClip (AudioClip.Create + SetData) the first time you
+// press it. These clips are plain uncompressed audio, which the voice recorder can read.
+// 8/16/24/32-bit PCM and 32-bit float are supported; stereo is mixed down to mono.
+
+extern void (*const kSlotFns[kMaxSounds])();
+static std::string g_wavPath[kMaxSounds];
+static bool g_wavMode = false;
+static constexpr size_t kMaxWavBytes = 40u * 1024 * 1024;
+static constexpr int kMaxWavSeconds = 90;
+
+static std::string SoundsDir() {
+    const char *d = ym::api()->modsDir;
+    return std::string(d ? d : "") + "/sounds";
+}
+static bool IsWavName(const char *n) {
+    size_t l = strlen(n);
+    return l > 4 && strcasecmp(n + l - 4, ".wav") == 0;
+}
+static bool ReadFileBytes(const std::string &path, std::vector<uint8_t> &out) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0 || (size_t)n > kMaxWavBytes) { fclose(f); return false; }
+    out.resize((size_t)n);
+    size_t got = fread(out.data(), 1, out.size(), f);
+    fclose(f);
+    return got == out.size();
+}
+// RIFF/WAVE -> mono floats in -1..1. Returns false for anything it can't read.
+static bool DecodeWav(const std::vector<uint8_t> &b, std::vector<float> &mono, int &rate) {
+    auto u16 = [&](size_t o) { return (uint32_t)b[o] | ((uint32_t)b[o + 1] << 8); };
+    auto u32 = [&](size_t o) { return (uint32_t)b[o] | ((uint32_t)b[o + 1] << 8) | ((uint32_t)b[o + 2] << 16) | ((uint32_t)b[o + 3] << 24); };
+    if (b.size() < 44 || memcmp(&b[0], "RIFF", 4) != 0 || memcmp(&b[8], "WAVE", 4) != 0) return false;
+    uint32_t fmt = 0, ch = 0, bits = 0, hz = 0;
+    size_t dataOff = 0, dataLen = 0;
+    size_t o = 12;
+    while (o + 8 <= b.size()) {
+        uint32_t len = u32(o + 4);
+        if (memcmp(&b[o], "fmt ", 4) == 0 && len >= 16 && o + 8 + 16 <= b.size()) {
+            fmt = u16(o + 8); ch = u16(o + 10); hz = u32(o + 12); bits = u16(o + 22);
+            if (fmt == 0xFFFE && len >= 40 && o + 8 + 26 <= b.size()) fmt = u16(o + 8 + 24);   // WAVE_FORMAT_EXTENSIBLE
+        } else if (memcmp(&b[o], "data", 4) == 0) {
+            dataOff = o + 8;
+            dataLen = std::min<size_t>(len, b.size() - dataOff);
+            break;
+        }
+        o += 8 + (size_t)len + (len & 1);
+    }
+    bool pcm = fmt == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32);
+    bool flt = fmt == 3 && bits == 32;
+    if ((!pcm && !flt) || ch < 1 || ch > 8 || hz < 8000 || hz > 192000 || dataLen == 0) return false;
+    size_t bps = bits / 8, frames = dataLen / (ch * bps);
+    if (frames == 0 || frames > (size_t)hz * kMaxWavSeconds) return false;
+    mono.assign(frames, 0.0f);
+    for (size_t f = 0; f < frames; f++) {
+        float sum = 0;
+        for (uint32_t c = 0; c < ch; c++) {
+            size_t p = dataOff + (f * ch + c) * bps;
+            float v;
+            if (flt) { memcpy(&v, &b[p], 4); }
+            else if (bits == 8) v = ((int)b[p] - 128) / 128.0f;
+            else if (bits == 16) v = (int16_t)u16(p) / 32768.0f;
+            else if (bits == 24) v = (int32_t)(((uint32_t)b[p] << 8) | ((uint32_t)b[p + 1] << 16) | ((uint32_t)b[p + 2] << 24)) / 2147483648.0f;
+            else v = (int32_t)u32(p) / 2147483648.0f;
+            sum += v;
+        }
+        mono[f] = sum / (float)ch;
+    }
+    rate = (int)hz;
+    return true;
+}
+// Builds slot i's AudioClip from its file (once; it stays cached until the list changes).
+static bool LoadWav(int i) {
+    if (i < 0 || i >= g_soundCount || g_wavPath[i].empty()) return false;
+    if (Alive(g_clip[i].get())) return true;
+    if (!G.clipCreate.IsValid() || !G.clipSetData.IsValid() || !G.arrayNew || !G.singleClass) return false;
+    std::vector<uint8_t> bytes;
+    if (!ReadFileBytes(g_wavPath[i], bytes)) { ym::log("starter-menu: can't read %s (missing or over 40 MB)", g_wavPath[i].c_str()); return false; }
+    std::vector<float> mono;
+    int rate = 0;
+    if (!DecodeWav(bytes, mono, rate)) { ym::log("starter-menu: %s is not a supported .wav (or longer than %d s)", g_wavPath[i].c_str(), kMaxWavSeconds); return false; }
+    bytes.clear();
+    bytes.shrink_to_fit();
+    Il2CppObject *clip = G.clipCreate((BNM::Structures::Mono::String *)CreateMonoString(g_clipName[i]), (int)mono.size(), 1, rate, false);
+    if (!clip) return false;
+    void *arr = G.arrayNew((void *)G.singleClass, mono.size());
+    if (!arr) return false;
+    memcpy((uint8_t *)arr + 0x20, mono.data(), mono.size() * sizeof(float));
+    if (!G.clipSetData[clip]((Il2CppObject *)arr, 0)) { ym::log("starter-menu: SetData failed for %s", g_wavPath[i].c_str()); return false; }
+    g_clip[i].set(clip);
+    ym::log("starter-menu: loaded %s (%zu frames, %d Hz)", g_wavPath[i].c_str(), mono.size(), rate);
+    return true;
+}
+// Lists the .wav files (names only; nothing is decoded until you press one).
+static bool ScanWavs() {
+    if (!G.clipCreate.IsValid() || !G.clipSetData.IsValid() || !G.arrayNew || !G.singleClass || !G.asPlayOneShot.IsValid()) return false;
+    std::string dir = SoundsDir();
+    DIR *d = opendir(dir.c_str());
+    if (!d) { ym::log("starter-menu: no sounds folder at %s", dir.c_str()); return false; }
+    std::vector<std::string> names;
+    while (dirent *e = readdir(d)) if (IsWavName(e->d_name)) names.push_back(e->d_name);
+    closedir(d);
+    if (names.empty()) { ym::log("starter-menu: no .wav files in %s", dir.c_str()); return false; }
+    std::sort(names.begin(), names.end());
+    size_t start = (size_t)g_clipOffset % names.size();
+    g_soundCount = 0;
+    for (int k = 0; k < kMaxSounds && k < (int)names.size(); k++) {
+        const std::string &nm = names[(start + k) % names.size()];
+        std::string path = dir + "/" + nm;
+        if (g_wavPath[k] != path) g_clip[k].clear();               // keep a clip that's still in the same slot
+        g_wavPath[k] = path;
+        snprintf(g_clipName[k], sizeof g_clipName[k], "%s", nm.substr(0, nm.size() - 4).c_str());
+        g_soundItems[k] = Item{SOUNDS, g_clipName[k], ACTION, MAIN, nullptr, kSlotFns[k]};
+        g_soundCount++;
+    }
+    for (int k = g_soundCount; k < kMaxSounds; k++) { g_clip[k].clear(); g_wavPath[k].clear(); }
+    g_wavMode = true;
+    ym::log("starter-menu: found %zu .wav files in %s", names.size(), dir.c_str());
+    return true;
+}
+
 static void PlayClip(int i) {
     if (i < 0 || i >= g_soundCount) return;
+    if (g_wavMode && !LoadWav(i)) { Notify("Can't load that .wav"); return; }
     Il2CppObject *clip = g_clip[i].get();
     if (!Alive(clip) || !G.asPlayOneShot.IsValid() || !EnsureSource()) { Notify("Can't play that one"); return; }
     G.asPlayOneShot[g_soundSrc.get()](clip, kSoundVolumes[g_soundVol]);
@@ -1624,12 +1809,16 @@ static void PlayClip(int i) {
     else Notify("Playing: %s", g_clipName[i]);
 }
 template <int N> static void PlaySlot() { PlayClip(N); }
-static void (*const kSlotFns[kMaxSounds])() = {
+void (*const kSlotFns[kMaxSounds])() = {
     PlaySlot<0>, PlaySlot<1>, PlaySlot<2>,  PlaySlot<3>,  PlaySlot<4>,  PlaySlot<5>,  PlaySlot<6>,  PlaySlot<7>,
-    PlaySlot<8>, PlaySlot<9>, PlaySlot<10>, PlaySlot<11>, PlaySlot<12>, PlaySlot<13>, PlaySlot<14>, PlaySlot<15>};
+    PlaySlot<8>, PlaySlot<9>, PlaySlot<10>, PlaySlot<11>, PlaySlot<12>, PlaySlot<13>, PlaySlot<14>, PlaySlot<15>,
+    PlaySlot<16>, PlaySlot<17>, PlaySlot<18>, PlaySlot<19>, PlaySlot<20>, PlaySlot<21>, PlaySlot<22>, PlaySlot<23>,
+    PlaySlot<24>, PlaySlot<25>, PlaySlot<26>, PlaySlot<27>, PlaySlot<28>, PlaySlot<29>, PlaySlot<30>, PlaySlot<31>};
 
 // One search of the loaded clips each time the page opens (not per frame).
-static void ScanClips() {
+static void ScanGameClips() {
+    g_wavMode = false;
+    for (auto &w : g_wavPath) w.clear();
     g_soundCount = 0;
     for (auto &r : g_clip) r.clear();
     if (!G.findAll.IsValid() || !G.tAudioClip || !G.objGetName.IsValid() || !G.asPlayOneShot.IsValid()) {
@@ -1660,11 +1849,86 @@ static void ScanClips() {
         g_soundCount++;
     }
 }
+static void ScanClips() {
+    if (ScanWavs()) return;          // .wav files first
+    ScanGameClips();                 // none found: the game's own sounds
+}
+static void RescanSongs() {
+    g_clipOffset = 0;
+    ScanClips();
+    g_page = 0;
+    if (g_wavMode) Notify("Found %d songs", g_soundCount);
+    else Notify("No .wav files, put them in the sounds folder");
+}
 static void MoreSounds() { g_clipOffset += kMaxSounds; ScanClips(); g_page = 0; Notify("Next sounds"); }
 static void StopSounds() { Kill(g_soundGo); g_soundSrc.clear(); RestoreMic(); Notify("Sounds stopped"); }
 static void NextSoundVolume() {
     g_soundVol = (g_soundVol + 1) % 3;
     Notify("Sound volume: %d%%", (int)(kSoundVolumes[g_soundVol] * 100));
+}
+
+// ---- size changer ----------------------------------------------------------------
+// Scales your own player object. Whether other players see it depends on the game: if it
+// only syncs position and rotation, the change stays on your screen. Turning it off puts the
+// original scale back.
+
+static const float kSizes[] = {0.25f, 0.5f, 2.0f, 4.0f, 10.0f};
+static const char *kSizeNames[] = {"tiny", "small", "big", "huge", "giant"};
+static int g_sizeIdx = 2;
+static bool g_sizeApplied = false, g_sizeHaveBase = false;
+static Vector3 g_sizeBase = Vector3(1, 1, 1);
+
+static void NextSize() {
+    g_sizeIdx = (g_sizeIdx + 1) % 5;
+    Notify("Size: %s (%.2gx)", kSizeNames[g_sizeIdx], kSizes[g_sizeIdx]);
+}
+static void SizeTick() {
+    Il2CppObject *t = PlayerTransform();
+    if (!t || !G.trSetLocalScale.IsValid()) return;
+    if (f_size) {
+        if (!g_sizeHaveBase && G.trGetLocalScale.IsValid()) { g_sizeBase = G.trGetLocalScale[t](); g_sizeHaveBase = true; }
+        float k = kSizes[g_sizeIdx];
+        G.trSetLocalScale[t](Vector3(g_sizeBase.x * k, g_sizeBase.y * k, g_sizeBase.z * k));
+        g_sizeApplied = true;
+    } else if (g_sizeApplied) {
+        G.trSetLocalScale[t](g_sizeBase);
+        g_sizeApplied = false;
+    }
+}
+
+// ---- font ------------------------------------------------------------------------
+// The menu's text uses whatever font is in G.font when the menu is built. Changing the font
+// rebuilds the menu on the next frame (so every label gets it).
+
+static bool g_rebuildMenu = false;
+static std::string g_fontNotice;
+
+static void ChangeFont() {
+    if (!G.findAll.IsValid() || !G.tFont || !G.objGetName.IsValid()) { Notify("Fonts aren't available"); return; }
+    auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tFont);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    std::vector<Il2CppObject *> fonts;
+    for (size_t i = 0; i < n && fonts.size() < 64; i++) {
+        Il2CppObject *f = ((Il2CppObject **)(arr + 0x20))[i];
+        if (Alive(f)) fonts.push_back(f);
+    }
+    if (fonts.empty()) { Notify("No fonts found"); return; }
+    Il2CppObject *cur = G.font.get();
+    size_t next = 0;
+    for (size_t i = 0; i < fonts.size(); i++) if (fonts[i] == cur) { next = (i + 1) % fonts.size(); break; }
+    G.font.set(fonts[next]);
+    auto *nm = G.objGetName[fonts[next]]();
+    g_fontNotice = nm ? nm->str() : "?";
+    g_rebuildMenu = true;                              // done at the start of the next frame
+    ym::log("starter-menu: font %zu/%zu: %s", next + 1, fonts.size(), g_fontNotice.c_str());
+}
+// Throws away the menu objects so BuildMenu makes them again (with the new font).
+static void TeardownMenu() {
+    Show(g_menu, false);
+    for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
+    for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
+    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo}) Kill(*r);
+    g_built = false; g_menuShown = false; g_touching = -2; g_hover = -2;
 }
 
 // ---- callbacks ---------------------------------------------------------------
@@ -1684,6 +1948,7 @@ static void OnRoomChange() {
     g_boosted = nullptr;
     g_gravityOff = false;
     g_micActive = false; g_micRestoreAt = 0; g_micRec.clear(); g_micOrigClip.clear(); g_micOrigSource = -1;
+    g_sizeApplied = false; g_sizeHaveBase = false;     // the player object is new: read its scale again
     for (Ref *r : {&g_player, &g_rigidbody, &g_leftHand, &g_rightHand, &g_head}) r->clear();
     g_built = false; g_menuShown = false; g_touching = -2; g_haveSpot = false;
 }
@@ -1706,7 +1971,9 @@ static void OnUpdate(float dt) {
         if (pgo) g_rigidbody.set(G.goGetComponent[pgo](G.tRigidbody));
     }
     if (!g_leftHand.get() || !g_rightHand.get() || !g_head.get()) return;
+    if (g_rebuildMenu) { g_rebuildMenu = false; TeardownMenu(); }
     if (!g_built) BuildMenu();
+    if (!g_fontNotice.empty() && g_built) { Notify("Font: %s", g_fontNotice.c_str()); g_fontNotice.clear(); }
 
     Buttons in = ReadButtons();
     ShowMenu(f_rightHand ? in.b : in.y);
@@ -1728,6 +1995,7 @@ static void OnUpdate(float dt) {
     ApplySpeedBoost();
     ApplyGravity();
     NoclipTick(in);
+    SizeTick();
     TeleportGunTick(in);
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("starter-menu: item code error"); }
