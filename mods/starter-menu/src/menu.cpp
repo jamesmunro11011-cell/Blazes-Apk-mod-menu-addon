@@ -1572,18 +1572,26 @@ static void RestoreMic() {
     g_micOrigClip.clear();
     g_micOrigSource = -1;
 }
+// Why the last mic attempt failed, shown in the notification (so no adb is needed).
+static char g_micWhy[80] = "";
 // Returns true if the clip was handed to the voice recorder.
 static bool PlayThroughMic(int i) {
+    g_micWhy[0] = 0;
     if (!f_micSounds) return false;
+    if (!G.tRecorder) { snprintf(g_micWhy, sizeof g_micWhy, "no Photon Recorder class"); return false; }
     Il2CppObject *clip = g_clip[i].get();
     if (!Alive(clip)) return false;
     if (!MicHooksOk()) {
         ym::log("starter-menu: mic hooks missing (see 'mic hooks:' line from startup)");
+        snprintf(g_micWhy, sizeof g_micWhy, "hooks missing clip%d src%d restart%d",
+                 G.recSetClip.IsValid() || G.recorderAudioClip.IsValid(),
+                 G.recSetSourceType.IsValid() || G.recorderSourceType.IsValid(),
+                 G.recorderRestart.IsValid() || G.recorderRestart1.IsValid());
         return false;
     }
     Il2CppObject *rec = g_micActive ? g_micRec.get() : FindRecorder();
     if (!Alive(rec)) { g_micActive = false; rec = FindRecorder(); }
-    if (!rec) { ym::log("starter-menu: no Recorder for mic playback"); return false; }
+    if (!rec) { ym::log("starter-menu: no Recorder for mic playback"); snprintf(g_micWhy, sizeof g_micWhy, "no live Recorder found"); return false; }
     if (!g_micActive) {                           // remember what it was doing, once
         g_micRec.set(rec);
         g_micOrigClip.set(G.recGetClip.IsValid() ? G.recGetClip[rec]() : nullptr);
@@ -1591,6 +1599,7 @@ static bool PlayThroughMic(int i) {
         g_micOrigLoop = G.recGetLoop.IsValid() ? G.recGetLoop[rec]() : true;
         g_micActive = true;
         ym::log("starter-menu: recorder was source=%d loop=%d", g_micOrigSource, (int)g_micOrigLoop);
+        snprintf(g_micWhy, sizeof g_micWhy, "ok");
     }
     if (G.clipLoadType.IsValid())
         ym::log("starter-menu: clip loadType=%d (0 = decompress on load; others may not play on the mic)", G.clipLoadType[clip]());
@@ -1610,7 +1619,9 @@ static void PlayClip(int i) {
     if (!Alive(clip) || !G.asPlayOneShot.IsValid() || !EnsureSource()) { Notify("Can't play that one"); return; }
     G.asPlayOneShot[g_soundSrc.get()](clip, kSoundVolumes[g_soundVol]);
     bool mic = PlayThroughMic(i);
-    Notify(mic ? "Playing (mic): %s" : "Playing: %s", g_clipName[i]);
+    if (mic) Notify("Playing (mic): %s", g_clipName[i]);
+    else if (f_micSounds && g_micWhy[0]) Notify("Local only: %s", g_micWhy);
+    else Notify("Playing: %s", g_clipName[i]);
 }
 template <int N> static void PlaySlot() { PlayClip(N); }
 static void (*const kSlotFns[kMaxSounds])() = {
@@ -1730,4 +1741,3 @@ YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     ym::log("Burger Menu loaded on %s (%s)", api->gameVersion, api->buildId);
     return 0;
 }
-
