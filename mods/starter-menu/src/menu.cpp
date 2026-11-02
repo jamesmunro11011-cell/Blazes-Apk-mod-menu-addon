@@ -1577,3 +1577,4 @@ YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     ym::log("Burger Menu loaded on %s (%s)", api->gameVersion, api->buildId);
     return 0;
 }
+
