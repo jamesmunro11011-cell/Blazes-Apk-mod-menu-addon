@@ -473,6 +473,7 @@ static void StopSounds();
 static void NextSoundVolume();
 static void MoreSounds();
 static void RescanSongs();
+static void RandomSound();
 
 enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SETTINGS, ENABLED, SOUNDS, NCAT };
 static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Settings", "Enabled Mods", "Soundboard"};
@@ -549,6 +550,7 @@ static Item g_items[] = {
     {SOUNDS, "Exit Soundboard", OPEN, MAIN},
     {SOUNDS, "Stop Sounds", ACTION, MAIN, nullptr, StopSounds},
     {SOUNDS, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
+    {SOUNDS, "Random Sound", ACTION, MAIN, nullptr, RandomSound},
     {SOUNDS, "Play Through Mic", TOGGLE, MAIN, &f_micSounds},
     {SOUNDS, "Rescan Songs", ACTION, MAIN, nullptr, RescanSongs},
     {SOUNDS, "More Sounds", ACTION, MAIN, nullptr, MoreSounds},
@@ -603,6 +605,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Soundboard", "Plays .wav files from the sounds folder (or the game's sounds). Everyone hears them on your mic."},
     {"Rescan Songs", "Looks in the sounds folder again."},
     {"Stop Sounds", "Stops everything the soundboard is playing."},
+    {"Random Sound", "Plays a random sound from the current list."},
     {"Sound Volume", "Loud, medium or quiet."},
     {"Play Through Mic", "On: everyone hears the sound on your voice chat. Off: only you."},
     {"More Sounds", "Shows the next set of sounds."},
@@ -1552,6 +1555,7 @@ static int g_clipOffset = 0, g_soundVol = 0;
 // mic routing state: what the Recorder was doing before we borrowed it
 static Ref g_micRec, g_micOrigClip;
 static bool g_micActive = false, g_micOrigLoop = true;
+static bool g_soundsStale = false;               // room changed: clips/source from the old room are gone, rescan
 static int g_micOrigSource = -1;                 // Recorder.InputSourceType: 0 Microphone, 1 AudioClip, 2 Factory
 static double g_micRestoreAt = 0;
 static constexpr int kSrcMic = 0, kSrcClip = 1;
@@ -1640,6 +1644,12 @@ static bool PlayThroughMic(int i) {
     if (!G.tRecorder) { snprintf(g_micWhy, sizeof g_micWhy, "no Photon Recorder class"); return false; }
     Il2CppObject *clip = g_clip[i].get();
     if (!Alive(clip)) return false;
+    // Compressed / streamed clips can't be read by the voice recorder. Handing one over breaks the mic
+    // until RestoreMic runs, so keep those local only.
+    if (G.clipLoadType.IsValid() && G.clipLoadType[clip]() != 0) {
+        snprintf(g_micWhy, sizeof g_micWhy, "clip is compressed, can't go on mic");
+        return false;
+    }
     if (!MicHooksOk()) {
         ym::log("starter-menu: mic hooks missing (see 'mic hooks:' line from startup)");
         snprintf(g_micWhy, sizeof g_micWhy, "hooks missing clip%d src%d restart%d",
@@ -1704,11 +1714,13 @@ static bool ReadFileBytes(const std::string &path, std::vector<uint8_t> &out) {
     fclose(f);
     return got == out.size();
 }
+static char g_wavWhy[96] = "";
 // RIFF/WAVE -> mono floats in -1..1. Returns false for anything it can't read.
 static bool DecodeWav(const std::vector<uint8_t> &b, std::vector<float> &mono, int &rate) {
     auto u16 = [&](size_t o) { return (uint32_t)b[o] | ((uint32_t)b[o + 1] << 8); };
     auto u32 = [&](size_t o) { return (uint32_t)b[o] | ((uint32_t)b[o + 1] << 8) | ((uint32_t)b[o + 2] << 16) | ((uint32_t)b[o + 3] << 24); };
-    if (b.size() < 44 || memcmp(&b[0], "RIFF", 4) != 0 || memcmp(&b[8], "WAVE", 4) != 0) return false;
+    g_wavWhy[0] = 0;
+    if (b.size() < 44 || memcmp(&b[0], "RIFF", 4) != 0 || memcmp(&b[8], "WAVE", 4) != 0) { snprintf(g_wavWhy, sizeof g_wavWhy, "not a RIFF/WAVE file"); return false; }
     uint32_t fmt = 0, ch = 0, bits = 0, hz = 0;
     size_t dataOff = 0, dataLen = 0;
     size_t o = 12;
@@ -1725,17 +1737,24 @@ static bool DecodeWav(const std::vector<uint8_t> &b, std::vector<float> &mono, i
         o += 8 + (size_t)len + (len & 1);
     }
     bool pcm = fmt == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32);
-    bool flt = fmt == 3 && bits == 32;
-    if ((!pcm && !flt) || ch < 1 || ch > 8 || hz < 8000 || hz > 192000 || dataLen == 0) return false;
+    bool flt = fmt == 3 && (bits == 32 || bits == 64);
+    if ((!pcm && !flt) || ch < 1 || ch > 8 || hz < 8000 || hz > 192000 || dataLen == 0) {
+        snprintf(g_wavWhy, sizeof g_wavWhy, "format %u, %u-bit, %u ch, %u Hz, data %zu", fmt, bits, ch, hz, dataLen);
+        return false;
+    }
     size_t bps = bits / 8, frames = dataLen / (ch * bps);
-    if (frames == 0 || frames > (size_t)hz * kMaxWavSeconds) return false;
+    if (frames == 0 || frames > (size_t)hz * kMaxWavSeconds) {
+        snprintf(g_wavWhy, sizeof g_wavWhy, "too long: %zu s (max %d)", hz ? frames / hz : 0, kMaxWavSeconds);
+        return false;
+    }
     mono.assign(frames, 0.0f);
     for (size_t f = 0; f < frames; f++) {
         float sum = 0;
         for (uint32_t c = 0; c < ch; c++) {
             size_t p = dataOff + (f * ch + c) * bps;
             float v;
-            if (flt) { memcpy(&v, &b[p], 4); }
+            if (flt && bits == 64) { double dv; memcpy(&dv, &b[p], 8); v = (float)dv; }
+            else if (flt) { memcpy(&v, &b[p], 4); }
             else if (bits == 8) v = ((int)b[p] - 128) / 128.0f;
             else if (bits == 16) v = (int16_t)u16(p) / 32768.0f;
             else if (bits == 24) v = (int32_t)(((uint32_t)b[p] << 8) | ((uint32_t)b[p + 1] << 16) | ((uint32_t)b[p + 2] << 24)) / 2147483648.0f;
@@ -1749,6 +1768,7 @@ static bool DecodeWav(const std::vector<uint8_t> &b, std::vector<float> &mono, i
 }
 // Builds slot i's AudioClip from its file (once; it stays cached until the list changes).
 static bool LoadWav(int i) {
+    g_wavWhy[0] = 0;
     if (i < 0 || i >= g_soundCount || g_wavPath[i].empty()) return false;
     if (Alive(g_clip[i].get())) return true;
     if (!G.clipCreate.IsValid() || !G.clipSetData.IsValid() || !G.arrayNew || !G.singleClass) return false;
@@ -1756,7 +1776,11 @@ static bool LoadWav(int i) {
     if (!ReadFileBytes(g_wavPath[i], bytes)) { ym::log("starter-menu: can't read %s (missing or over 40 MB)", g_wavPath[i].c_str()); return false; }
     std::vector<float> mono;
     int rate = 0;
-    if (!DecodeWav(bytes, mono, rate)) { ym::log("starter-menu: %s is not a supported .wav (or longer than %d s)", g_wavPath[i].c_str(), kMaxWavSeconds); return false; }
+    if (!DecodeWav(bytes, mono, rate)) {
+        ym::log("starter-menu: %s is not a supported .wav: %s", g_wavPath[i].c_str(), g_wavWhy);
+        Notify("Can't load .wav: %s", g_wavWhy);
+        return false;
+    }
     bytes.clear();
     bytes.shrink_to_fit();
     Il2CppObject *clip = G.clipCreate((BNM::Structures::Mono::String *)CreateMonoString(g_clipName[i]), (int)mono.size(), 1, rate, false);
@@ -1799,7 +1823,7 @@ static bool ScanWavs() {
 
 static void PlayClip(int i) {
     if (i < 0 || i >= g_soundCount) return;
-    if (g_wavMode && !LoadWav(i)) { Notify("Can't load that .wav"); return; }
+    if (g_wavMode && !LoadWav(i)) { if (!g_wavWhy[0]) Notify("Can't load that .wav"); return; }
     Il2CppObject *clip = g_clip[i].get();
     if (!Alive(clip) || !G.asPlayOneShot.IsValid() || !EnsureSource()) { Notify("Can't play that one"); return; }
     G.asPlayOneShot[g_soundSrc.get()](clip, kSoundVolumes[g_soundVol]);
@@ -1807,6 +1831,21 @@ static void PlayClip(int i) {
     if (mic) Notify("Playing (mic): %s", g_clipName[i]);
     else if (f_micSounds && g_micWhy[0]) Notify("Local only: %s", g_micWhy);
     else Notify("Playing: %s", g_clipName[i]);
+}
+// Plays a random sound from the list on the page (never the same one twice in a row).
+static void RandomSound() {
+    if (g_soundCount <= 0) { Notify("No sounds to pick from"); return; }
+    static int last = -1;
+    static uint32_t rng = 0;
+    if (!rng) rng = 2463534242u ^ (uint32_t)(g_time * 1000.0) ^ ((uint32_t)g_frames << 8);
+    int pick = 0;
+    for (int tries = 0; tries < 8; tries++) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;          // xorshift32
+        pick = (int)(rng % (uint32_t)g_soundCount);
+        if (pick != last || g_soundCount == 1) break;
+    }
+    last = pick;
+    PlayClip(pick);
 }
 template <int N> static void PlaySlot() { PlayClip(N); }
 void (*const kSlotFns[kMaxSounds])() = {
@@ -1828,17 +1867,24 @@ static void ScanGameClips() {
     auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tAudioClip);
     size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
     std::vector<Il2CppObject *> found;
-    for (size_t i = 0; i < n && found.size() < 512; i++) {
-        Il2CppObject *c = ((Il2CppObject **)(arr + 0x20))[i];
-        if (!Alive(c)) continue;
-        auto *name = G.objGetName[c]();
-        if (!name || name->str().empty()) continue;
-        if (G.clipLength.IsValid()) {                              // short effects only
-            float len = G.clipLength[c]();
-            if (len < 0.15f || len > 10.0f) continue;
+    auto collect = [&](bool readableOnly) {
+        found.clear();
+        for (size_t i = 0; i < n && found.size() < 512; i++) {
+            Il2CppObject *c = ((Il2CppObject **)(arr + 0x20))[i];
+            if (!Alive(c)) continue;
+            auto *name = G.objGetName[c]();
+            if (!name || name->str().empty()) continue;
+            if (G.clipLength.IsValid()) {                              // short effects only
+                float len = G.clipLength[c]();
+                if (len < 0.15f || len > 10.0f) continue;
+            }
+            if (readableOnly && G.clipLoadType[c]() != 0) continue;   // recorder can only read decompressed clips
+            found.push_back(c);
         }
-        found.push_back(c);
-    }
+    };
+    bool wantMic = f_micSounds && G.clipLoadType.IsValid();
+    collect(wantMic);
+    if (found.empty() && wantMic) collect(false);                  // nothing readable: local-only is better than nothing
     if (found.empty()) { Notify("No sounds found"); return; }
     size_t start = (size_t)g_clipOffset % found.size();
     for (int k = 0; k < kMaxSounds && k < (int)found.size(); k++) {
@@ -1947,7 +1993,13 @@ static void OnRoomChange() {
     }
     g_boosted = nullptr;
     g_gravityOff = false;
+    // The Photon Recorder often survives a room change. If it's still on our clip, put it back on the real mic
+    // before forgetting it, otherwise your mic stays broken in the new lobby.
+    RestoreMic();
     g_micActive = false; g_micRestoreAt = 0; g_micRec.clear(); g_micOrigClip.clear(); g_micOrigSource = -1;
+    g_soundSrc.clear();
+    for (auto &c : g_clip) c.clear();     // clips from the old room are destroyed; wavs are rebuilt on press
+    g_soundsStale = true;
     g_sizeApplied = false; g_sizeHaveBase = false;     // the player object is new: read its scale again
     for (Ref *r : {&g_player, &g_rigidbody, &g_leftHand, &g_rightHand, &g_head}) r->clear();
     g_built = false; g_menuShown = false; g_touching = -2; g_haveSpot = false;
@@ -1973,6 +2025,10 @@ static void OnUpdate(float dt) {
     if (!g_leftHand.get() || !g_rightHand.get() || !g_head.get()) return;
     if (g_rebuildMenu) { g_rebuildMenu = false; TeardownMenu(); }
     if (!g_built) BuildMenu();
+    if (g_soundsStale && g_built) {                 // new room: rebuild the soundboard list
+        g_soundsStale = false;
+        if (g_soundCount > 0) { ScanClips(); g_dirty = true; }
+    }
     if (!g_fontNotice.empty() && g_built) { Notify("Font: %s", g_fontNotice.c_str()); g_fontNotice.clear(); }
 
     Buttons in = ReadButtons();
@@ -2009,3 +2065,4 @@ YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     ym::log("Burger Menu loaded on %s (%s)", api->gameVersion, api->buildId);
     return 0;
 }
+
