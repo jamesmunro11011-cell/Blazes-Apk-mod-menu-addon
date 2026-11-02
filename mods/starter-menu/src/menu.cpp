@@ -1,10 +1,10 @@
-// Blaze Menu (the starter menu): a hand menu in the style of ii's Stupid Menu (Gorilla Tag).
+// Burger Menu (the starter menu): a hand menu in the style of ii's Stupid Menu (Gorilla Tag).
 // The layout idea comes from ii's menu; the code is new.
 //   Hold Y (left hand)      -> menu on your left hand, tipped like ii's; turn your palm to you
 //                              (B and the right hand with "Right Hand Menu")
 //   Touch a button with your other index finger to press it
 //   < and > on the sides    -> previous / next page
-//   Pages: Movement Mods, Rig Mods, Items, Settings, Enabled Mods
+//   Pages: Movement Mods, Rig Mods, Items, Settings, Enabled Mods, Soundboard (local only)
 // Movement only changes your own game. Rig mods (dances) and Items are seen by the room,
 // within the limits in AGENTS.md ("Things others see"). Read docs/GUIDE.md before adding.
 #include "ymsdk.hpp"
@@ -20,7 +20,7 @@ using namespace BNM;
 using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
-YEEPS_MOD("Blaze Menu")
+YEEPS_MOD("Burger Menu")
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -105,6 +105,11 @@ static struct {
     Method<void> goSetLayer;
     BNM::MonoType *tRigidbody = nullptr, *tCollider = nullptr, *tCanvas = nullptr, *tText = nullptr,
                   *tFont = nullptr, *tRenderer = nullptr, *tMeshCollider = nullptr, *tLine = nullptr;
+    // soundboard: the game's own clips, played locally
+    Method<void> asPlayOneShot, asSetSpatial;
+    Method<float> clipLength;
+    Method<BNM::Structures::Mono::String *> objGetName;
+    BNM::MonoType *tAudioSource = nullptr, *tAudioClip = nullptr;
     Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger;
 } G;
 
@@ -247,6 +252,17 @@ static bool Lookups() {
     G.tRenderer = rend.GetMonoType();
     G.tCanvas = canvas.GetMonoType();
     G.tText = text.GetMonoType();
+    {   // soundboard (optional: if any of this is missing the page just says so)
+        Class asrc("UnityEngine", "AudioSource"), aclip("UnityEngine", "AudioClip");
+        if (asrc.IsValid() && aclip.IsValid()) {
+            G.tAudioSource = asrc.GetMonoType();
+            G.tAudioClip = aclip.GetMonoType();
+            G.asPlayOneShot = Overload(asrc, "PlayOneShot", {"UnityEngine.AudioClip", "System.Single"});
+            G.asSetSpatial = asrc.GetMethod("set_spatialBlend", 1);
+            G.clipLength = aclip.GetMethod("get_length", 0);
+        }
+        G.objGetName = obj.GetMethod("get_name", 0);
+    }
     G.tFont = Class("UnityEngine", "Font").GetMonoType();
     G.usagePrimary.set((Il2CppObject *)CreateMonoString("PrimaryButton"));
     G.usageSecondary.set((Il2CppObject *)CreateMonoString("SecondaryButton"));
@@ -350,9 +366,13 @@ static void DancePicked();
 static void ArmDupe9();
 static void ArmDupe27();
 static bool LeftHandItem();
+static void ScanClips();
+static void StopSounds();
+static void NextSoundVolume();
+static void MoreSounds();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SETTINGS, ENABLED, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Settings", "Enabled Mods"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SETTINGS, ENABLED, SOUNDS, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Settings", "Enabled Mods", "Soundboard"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -362,6 +382,11 @@ struct Item {
     bool *flag = nullptr;         // TOGGLE: the switch
     void (*fn)() = nullptr;       // ACTION, or called after a TOGGLE changes
 };
+// Soundboard rows are filled in when you open the page (ScanClips).
+static constexpr int kMaxSounds = 16;
+static Item g_soundItems[kMaxSounds];
+static int g_soundCount = 0;
+
 // The owner's layout (2026-10-31). Keep this order.
 static Item g_items[] = {
     {MAIN, "Settings", OPEN, SETTINGS},
@@ -369,6 +394,7 @@ static Item g_items[] = {
     {MAIN, "Rig Mods", OPEN, RIG},
     {MAIN, "Items", OPEN, ITEMS},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
+    {MAIN, "Soundboard", OPEN, SOUNDS},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
     {MOVEMENT, "Platforms", TOGGLE, MAIN, &f_platforms},
@@ -413,6 +439,11 @@ static Item g_items[] = {
     {SETTINGS, "Show Clock", TOGGLE, MAIN, &f_clock},
     {SETTINGS, "Notifications", TOGGLE, MAIN, &f_notify},
     {SETTINGS, "Turn Everything Off", ACTION, MAIN, nullptr, AllOff},
+
+    {SOUNDS, "Exit Soundboard", OPEN, MAIN},
+    {SOUNDS, "Stop Sounds", ACTION, MAIN, nullptr, StopSounds},
+    {SOUNDS, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
+    {SOUNDS, "More Sounds", ACTION, MAIN, nullptr, MoreSounds},
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
@@ -436,7 +467,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Low Gravity", "Jump higher, fall slower."},
     {"Save Spot", "Remembers where you are."},
     {"Go To Spot", "Teleports you to your saved spot."},
-    {"Change Menu Theme", "Blaze, Orange, Blue, Green, Purple, Dark."},
+    {"Change Menu Theme", "Burger, Blaze, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
@@ -458,6 +489,10 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
     {"Notifications", "Messages when you switch something."},
+    {"Soundboard", "Play the game's own sounds. Only you hear them."},
+    {"Stop Sounds", "Stops everything the soundboard is playing."},
+    {"Sound Volume", "Loud, medium or quiet."},
+    {"More Sounds", "Shows the next set of sounds."},
     {"Turn Everything Off", "Switches every mod off."},
 };
 static const char *TipFor(const char *label) {
@@ -469,6 +504,7 @@ static const char *TipFor(const char *label) {
 // Colors in the ii menu style: an animated background and darker buttons when on.
 struct Theme { const char *name; Color bgA, bgB, button, buttonOn, title; };
 static const Theme kThemes[] = {
+    {"Burger", Color(0.08f, 0.08f, 0.14f, 1), Color(0.24f, 0.09f, 0.32f, 1), Color(0.15f, 0.15f, 0.21f, 1), Color(0.62f, 0.22f, 0.82f, 1), Color(0.86f, 0.62f, 1.0f, 1)},
     {"Blaze",  Color(0.90f, 0.12f, 0.04f, 1), Color(1.0f, 0.42f, 0.0f, 1), Color(0.50f, 0.06f, 0.03f, 1), Color(1.0f, 0.45f, 0.05f, 1), Color(1.0f, 0.62f, 0.20f, 1)},
     {"Orange", Color(1.0f, 0.50f, 0.0f, 1), Color(1.0f, 0.40f, 0.0f, 1), Color(0.67f, 0.33f, 0.0f, 1), Color(0.33f, 0.16f, 0.0f, 1), Color(1.0f, 0.75f, 0.49f, 1)},
     {"Blue",   Color(0.20f, 0.50f, 1.0f, 1), Color(0.10f, 0.30f, 0.85f, 1), Color(0.10f, 0.28f, 0.65f, 1), Color(0.04f, 0.12f, 0.32f, 1), Color(0.70f, 0.85f, 1.0f, 1)},
@@ -511,6 +547,7 @@ static void BuildView() {
         for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
+        if (g_cat == SOUNDS) for (int i = 0; i < g_soundCount; i++) g_view.push_back(&g_soundItems[i]);
     }
     if (g_page >= PageCount()) g_page = 0;
 }
@@ -608,14 +645,14 @@ static void BuildMenu() {
 
     if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), kBoardW + 2 * kSideX, kBoardH + 0.1f)) {
         Il2CppObject *ct = Tr(canvas);
-        Label(ct, "Blaze", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 32, &g_title);
+        Label(ct, "Burger Menu", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 26, &g_title);
         for (int r = 0; r < kRows; r++)
             g_rowLabel[r].set(Label(ct, "", Vector3(0, RowY(r), 0), kBtnW, kBtnH, 19, &g_rowText[r]));
         Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, "", Vector3(0, -kBoardH / 2 - 0.02f, 0), kBoardW + 0.1f, 0.03f, 15, &g_tipText);
         char ver[64];
-        snprintf(ver, sizeof ver, "Blaze build %s", ym::api()->gameVersion);
+        snprintf(ver, sizeof ver, "Burger Menu  |  game %s", ym::api()->gameVersion);
         Label(ct, ver, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
     // Pointer: a small ball on the index finger of the other hand
@@ -683,10 +720,10 @@ static int Hex(float v) { return (int)(v < 0 ? 0 : v > 1 ? 255 : v * 255); }
 static void UpdateTitle() {
     if (g_time < g_nextTitle) return;
     g_nextTitle = g_time + 0.1;
-    static const Color kFire[] = {Color(1, 0.1f, 0.05f, 1), Color(1, 0.45f, 0, 1), Color(1, 0.8f, 0.2f, 1), Color(1, 0.45f, 0, 1)};
+    static const Color kFire[] = {Color(0.9f, 0.1f, 0.05f, 1), Color(1, 0.75f, 0.1f, 1), Color(0.75f, 0.45f, 0.15f, 1), Color(1, 0.75f, 0.1f, 1)};
     char buf[512];
     int n = 0;
-    const char *word = "Blaze";
+    const char *word = "Burger Menu";
     for (int i = 0; word[i]; i++) {
         float t = (float)g_time * 1.5f - i * 0.35f;
         Color c;
@@ -751,6 +788,7 @@ static void Press(Item *it) {
     case OPEN:
         g_cat = it->target;
         g_page = 0;
+        if (g_cat == SOUNDS) ScanClips();      // one search per open
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
@@ -1390,13 +1428,90 @@ static void SpawnOnHandTick(const Buttons &in) {
     g_itemQueue.push_back({G.trGetPosition[hand]() + G.trGetForward[hand]() * 0.1f, Vector3(0, 0, 0)});
 }
 
+// ---- soundboard (local only) ---------------------------------------------------
+// Plays clips the game already has, through a 2D audio source on your head. Only you
+// hear it: nothing goes to voice chat or the room, and no files are read.
+
+static Ref g_soundGo, g_soundSrc, g_clip[kMaxSounds];
+static char g_clipName[kMaxSounds][32];
+static int g_clipOffset = 0, g_soundVol = 0;
+static const float kSoundVolumes[] = {1.0f, 0.6f, 0.3f};
+
+static bool EnsureSource() {
+    if (Alive(g_soundSrc.get())) return true;
+    Kill(g_soundGo);
+    g_soundSrc.clear();
+    if (!G.tAudioSource || !g_head.get()) return false;
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("BlazeSounds"));
+    Il2CppObject *src = go ? G.goAddComponent[go](G.tAudioSource) : nullptr;
+    if (!src) return false;
+    Il2CppObject *t = Tr(go);
+    G.trSetParent[t](g_head.get(), false);
+    G.trSetLocalPosition[t](Vector3(0, 0, 0));
+    if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);      // 2D: the same in both ears
+    g_soundGo.set(go);
+    g_soundSrc.set(src);
+    return true;
+}
+
+static void PlayClip(int i) {
+    if (i < 0 || i >= g_soundCount) return;
+    Il2CppObject *clip = g_clip[i].get();
+    if (!Alive(clip) || !G.asPlayOneShot.IsValid() || !EnsureSource()) { Notify("Can't play that one"); return; }
+    G.asPlayOneShot[g_soundSrc.get()](clip, kSoundVolumes[g_soundVol]);
+    Notify("Playing: %s", g_clipName[i]);
+}
+template <int N> static void PlaySlot() { PlayClip(N); }
+static void (*const kSlotFns[kMaxSounds])() = {
+    PlaySlot<0>, PlaySlot<1>, PlaySlot<2>,  PlaySlot<3>,  PlaySlot<4>,  PlaySlot<5>,  PlaySlot<6>,  PlaySlot<7>,
+    PlaySlot<8>, PlaySlot<9>, PlaySlot<10>, PlaySlot<11>, PlaySlot<12>, PlaySlot<13>, PlaySlot<14>, PlaySlot<15>};
+
+// One search of the loaded clips each time the page opens (not per frame).
+static void ScanClips() {
+    g_soundCount = 0;
+    for (auto &r : g_clip) r.clear();
+    if (!G.findAll.IsValid() || !G.tAudioClip || !G.objGetName.IsValid() || !G.asPlayOneShot.IsValid()) {
+        Notify("Sounds aren't available");
+        return;
+    }
+    auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tAudioClip);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    std::vector<Il2CppObject *> found;
+    for (size_t i = 0; i < n && found.size() < 512; i++) {
+        Il2CppObject *c = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(c)) continue;
+        auto *name = G.objGetName[c]();
+        if (!name || name->str().empty()) continue;
+        if (G.clipLength.IsValid()) {                              // short effects only
+            float len = G.clipLength[c]();
+            if (len < 0.15f || len > 10.0f) continue;
+        }
+        found.push_back(c);
+    }
+    if (found.empty()) { Notify("No sounds found"); return; }
+    size_t start = (size_t)g_clipOffset % found.size();
+    for (int k = 0; k < kMaxSounds && k < (int)found.size(); k++) {
+        Il2CppObject *c = found[(start + k) % found.size()];
+        g_clip[k].set(c);
+        snprintf(g_clipName[k], sizeof g_clipName[k], "%s", G.objGetName[c]()->str().c_str());
+        g_soundItems[k] = Item{SOUNDS, g_clipName[k], ACTION, MAIN, nullptr, kSlotFns[k]};
+        g_soundCount++;
+    }
+}
+static void MoreSounds() { g_clipOffset += kMaxSounds; ScanClips(); g_page = 0; Notify("Next sounds"); }
+static void StopSounds() { Kill(g_soundGo); g_soundSrc.clear(); Notify("Sounds stopped"); }
+static void NextSoundVolume() {
+    g_soundVol = (g_soundVol + 1) % 3;
+    Notify("Sound volume: %d%%", (int)(kSoundVolumes[g_soundVol] * 100));
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
-    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo}) Kill(*r);
+    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_soundGo}) Kill(*r);
     PauseTrackers(false);
     g_dancing = false;
     g_gunLine.clear();
@@ -1459,6 +1574,6 @@ static void OnUpdate(float dt) {
 YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     if (!ym::init(api)) return -1;
     ym::onUpdate(OnUpdate);
-    ym::log("Blaze Menu loaded on %s (%s)", api->gameVersion, api->buildId);
+    ym::log("Burger Menu loaded on %s (%s)", api->gameVersion, api->buildId);
     return 0;
 }
