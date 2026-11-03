@@ -474,9 +474,11 @@ static void NextSoundVolume();
 static void MoreSounds();
 static void RescanSongs();
 static void RandomSound();
+static void SkeletonScan();
+static void SkeletonEvent();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SETTINGS, ENABLED, SOUNDS, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Settings", "Enabled Mods", "Soundboard"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SETTINGS, ENABLED, SOUNDS, FUN, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Settings", "Enabled Mods", "Soundboard", "Fun"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -499,6 +501,7 @@ static Item g_items[] = {
     {MAIN, "Items", OPEN, ITEMS},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
     {MAIN, "Soundboard", OPEN, SOUNDS},
+    {MAIN, "Fun", OPEN, FUN},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
     {MOVEMENT, "Platforms", TOGGLE, MAIN, &f_platforms},
@@ -554,6 +557,10 @@ static Item g_items[] = {
     {SOUNDS, "Play Through Mic", TOGGLE, MAIN, &f_micSounds},
     {SOUNDS, "Rescan Songs", ACTION, MAIN, nullptr, RescanSongs},
     {SOUNDS, "More Sounds", ACTION, MAIN, nullptr, MoreSounds},
+
+    {FUN, "Exit Fun", OPEN, MAIN},
+    {FUN, "Scan Skeleton Code", ACTION, MAIN, nullptr, SkeletonScan},
+    {FUN, "Skeleton Event (Local)", ACTION, MAIN, nullptr, SkeletonEvent},
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
@@ -561,6 +568,9 @@ static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
 // Tooltips, shown under the menu while your finger is on a button (like ii's).
 static const struct { const char *label, *tip; } kTips[] = {
     {"Settings", "Opens the settings."},
+    {"Fun", "Fun stuff. Only changes your own game."},
+    {"Scan Skeleton Code", "Looks for the skeleton event in the game and writes what it finds to the log."},
+    {"Skeleton Event (Local)", "Turns the skeleton event on for you only. Run the scan first."},
     {"Movement Mods", "Opens the movement mods."},
     {"Enabled Mods", "Shows every mod you have on."},
     {"Platforms", "Hold a grip to stand on a platform."},
@@ -1973,6 +1983,76 @@ static void TeardownMenu() {
     g_built = false; g_menuShown = false; g_touching = -2; g_hover = -2;
 }
 
+// ---- Fun page: skeleton event (LOCAL ONLY) ------------------------------------
+// The game's skeleton code has names this file can't know in advance, so this works in two
+// steps. "Scan Skeleton Code" looks through Assembly-CSharp for methods with "skeleton" in
+// the name and writes each one to the log (tag: skeleton-scan). "Skeleton Event (Local)" then
+// calls ONE plain on/off setter (a single bool parameter, "active" in the name). It never
+// calls anything with send / rpc / photon / network / broadcast / sync in its name, so nothing
+// is sent to other players. If the setter itself broadcasts, that is the game's doing: check the
+// scan log before relying on this, and stop if the room sees it.
+struct SkelHit { Class cls; MethodBase m; };
+static std::vector<SkelHit> g_skelHits;
+
+static bool SkelBlockedName(const char *n) {
+    for (const char *bad : {"send", "rpc", "photon", "network", "broadcast", "sync"})
+        if (ContainsNoCase(n, bad)) return true;
+    return false;
+}
+
+static void SkeletonScan() {
+    g_skelHits.clear();
+    int classes = 0;
+    try {
+        Image img("Assembly-CSharp.dll");
+        for (auto &c : img.GetClasses()) {       // if your BNM names this differently, adjust here
+            classes++;
+            for (auto &m : c.GetMethods(false)) {
+                auto *mi = m.GetInfo();
+                if (!mi || !mi->name || !ContainsNoCase(mi->name, "skeleton")) continue;
+                auto *k = c.GetClass();
+                ym::log("skeleton-scan: %s::%s params=%d static=%d", (k && k->name) ? k->name : "?",
+                        mi->name, (int)mi->parameters_count, (mi->flags & 0x10) ? 1 : 0);
+                g_skelHits.push_back({c, m});
+            }
+        }
+    } catch (...) { ym::log("skeleton-scan: error"); Notify("Scan failed, see log"); return; }
+    ym::log("skeleton-scan: %d classes, %d skeleton methods", classes, (int)g_skelHits.size());
+    Notify("Found %d skeleton methods (see log)", (int)g_skelHits.size());
+}
+
+static void SkeletonEvent() {
+    if (g_skelHits.empty()) SkeletonScan();
+    const SkelHit *pick = nullptr;
+    int matches = 0;
+    for (auto &h : g_skelHits) {
+        auto *mi = h.m.GetInfo();
+        if (!mi || !mi->name || SkelBlockedName(mi->name)) continue;
+        if (mi->parameters_count != 1 || TypeName(mi->parameters[0]) != "System.Boolean") continue;
+        if (!ContainsNoCase(mi->name, "active")) continue;
+        pick = &h; matches++;
+    }
+    if (matches != 1) { Notify(matches ? "Several matches, see log" : "No local switch found, see log"); return; }
+    try {
+        auto *mi = pick->m.GetInfo();
+        Method<void> setter = pick->m;
+        if (mi->flags & 0x10) {                        // static: no object needed
+            setter(true);
+        } else {
+            Class cls = pick->cls;
+            Il2CppObject *type = (Il2CppObject *)cls.GetMonoType();
+            auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene(type)
+                                   : G.findSceneByType.IsValid() ? G.findSceneByType(type, 0) : nullptr);
+            size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+            Il2CppObject *inst = n ? ((Il2CppObject **)(arr + 0x20))[0] : nullptr;
+            if (!Alive(inst)) { Notify("No skeleton object in this room"); return; }
+            setter[inst](true);
+        }
+        ym::log("skeleton-event: called %s", mi->name);
+        Notify("Skeleton event on (local)");
+    } catch (...) { ym::log("skeleton-event: error"); Notify("Skeleton event failed, see log"); }
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
@@ -2061,4 +2141,5 @@ YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     ym::log("Burger Menu loaded on %s (%s)", api->gameVersion, api->buildId);
     return 0;
 }
+
 
