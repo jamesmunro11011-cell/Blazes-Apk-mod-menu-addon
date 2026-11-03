@@ -2009,16 +2009,22 @@ static void SkeletonScan() {
             classes++;
             for (auto &m : c.GetMethods(false)) {
                 auto *mi = m.GetInfo();
-                if (!mi || !mi->name || !ContainsNoCase(mi->name, "skeleton")) continue;
+                if (!mi || !mi->name) continue;
+                bool skel = ContainsNoCase(mi->name, "skeleton");
+                bool related = skel || ContainsNoCase(mi->name, "party") || ContainsNoCase(mi->name, "weather") ||
+                               ContainsNoCase(mi->name, "dance") || ContainsNoCase(mi->name, "halloween");
+                if (!related) continue;
                 auto *k = c.GetClass();
-                ym::log("skeleton-scan: %s::%s params=%d static=%d", (k && k->name) ? k->name : "?",
-                        mi->name, (int)mi->parameters_count, (mi->flags & 0x10) ? 1 : 0);
-                g_skelHits.push_back({c, m});
+                std::string ps;                                  // parameter types, e.g. "PartyType,System.Boolean"
+                for (int i = 0; i < (int)mi->parameters_count; i++) ps += (i ? "," : "") + TypeName(mi->parameters[i]);
+                ym::log("skeleton-scan: %s%s::%s(%s) static=%d", skel ? "[SKEL] " : "",
+                        (k && k->name) ? k->name : "?", mi->name, ps.c_str(), (mi->flags & 0x10) ? 1 : 0);
+                if (skel) g_skelHits.push_back({c, m});          // only skeleton methods can be activated
             }
         }
     } catch (...) { ym::log("skeleton-scan: error"); Notify("Scan failed, see log"); return; }
     ym::log("skeleton-scan: %d classes, %d skeleton methods", classes, (int)g_skelHits.size());
-    Notify("Found %d skeleton methods (see log)", (int)g_skelHits.size());
+    Notify("Found %d skeleton methods, related ones are in the log", (int)g_skelHits.size());
 }
 
 static void SkeletonEvent() {
@@ -2141,5 +2147,4 @@ YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     ym::log("Burger Menu loaded on %s (%s)", api->gameVersion, api->buildId);
     return 0;
 }
-
 
